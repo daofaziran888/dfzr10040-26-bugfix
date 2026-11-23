@@ -83,6 +83,45 @@ class ReplayQueue:
         entry.last_retry = _now_iso()
         return entry
 
+    def claim(self, entry_id: int, worker: str = "夜班") -> dict[str, Any]:
+        """原子领取待领条目：超时回队的旧作业也只能被领取一次。"""
+        entry = self._entries.get(entry_id)
+        if entry is None:
+            return {"ok": False, "claimed": False, "message": "重放记录不存在"}
+        if entry.queue_status != "待重放":
+            return {
+                "ok": False,
+                "claimed": False,
+                "duplicate": entry.queue_status == "重放中",
+                "status": entry.queue_status,
+                "message": f"重放记录 {entry.record_code} 当前不可领取",
+            }
+        entry.queue_status = "重放中"
+        entry.last_retry = _now_iso()
+        entry.checkpoint_data = {
+            **entry.checkpoint_data,
+            "claimed_by": worker,
+            "claim_token": f"{entry.record_code}-{entry.retry_count + 1}",
+            "claimed_at": entry.last_retry,
+        }
+        return {
+            "ok": True,
+            "claimed": True,
+            "status": entry.queue_status,
+            "claim_token": entry.checkpoint_data["claim_token"],
+            "entry": entry,
+        }
+
+    def reenter_pending(self, entry_id: int, reason: str = "执行超时") -> ReplayEntry | None:
+        """超时的旧作业重新进入待领集合，已缓存的试算数据原样保留。"""
+        entry = self._entries.get(entry_id)
+        if entry is None:
+            return None
+        entry.queue_status = "待重放"
+        entry.failure_reason = reason
+        entry.last_retry = _now_iso()
+        return entry
+
     def mark_success(self, entry_id: int) -> ReplayEntry | None:
         entry = self._entries.get(entry_id)
         if entry is None:

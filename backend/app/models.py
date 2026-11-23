@@ -70,6 +70,8 @@ class WideTableDef:
     ttl_days: int
     source_count: int
     last_updated: str
+    revision: int = 0
+    lineage_revision: int = 0
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -198,6 +200,13 @@ class SnapshotPartition:
     status_mark: str
     dependency_partitions: list[str]
     created_time: str
+    recompute_id: int = 0
+    lineage_revision: int = 0
+    source_codes: list[str] = field(default_factory=list)
+    aggregate_rows: list[dict[str, Any]] = field(default_factory=list)
+    lineage_evidence: list[dict[str, Any]] = field(default_factory=list)
+    procurement_eligible: bool = False
+    procurement_block_reason: str = ""
 
     def to_record(self) -> dict[str, Any]:
         return {
@@ -242,7 +251,12 @@ class ColdStoreStrategy:
 
 @dataclass
 class LineageEdge:
-    """数据血缘边：宽表字段与源表字段之间的血缘追踪。"""
+    """数据血缘边：宽表字段与源表字段之间的血缘追踪。
+
+    窄表构建产生的边额外携带目标宽表、来源作业、修订号与确认状态。
+    修复前产生的错配边不会删除，而是标记为历史（``historical=True``），
+    只能通过历史查询读取，不能用于确认新指标或生成补货依据。
+    """
     edge_id: int
     edge_code: str
     upstream_node: str
@@ -252,6 +266,95 @@ class LineageEdge:
     edge_type: str
     dependency_level: int
     last_traced: str
+    target_wide_table: str = ""
+    source_job_code: str = ""
+    support_key: str = ""
+    revision: int = 0
+    confirmation: str = "待确认"
+    historical: bool = False
+    invalid_reason: str = ""
+    confirmed_by: str = ""
+    confirmed_at: str = ""
+
+    def target_table(self) -> str:
+        """返回这条边实际归属的目标宽表。"""
+        return self.target_wide_table or self.downstream_node
+
+    def is_active(self) -> bool:
+        """历史边/废弃边不再参与来源计数、指标确认和采购导出。"""
+        return not self.historical and self.confirmation not in {"历史", "已废弃"}
+
+    def is_confirmed(self) -> bool:
+        return self.is_active() and self.confirmation == "已确认"
+
+    def to_evidence(self) -> dict[str, Any]:
+        """输出可核查的血缘依据。"""
+        return {
+            "edge_id": self.edge_id,
+            "edge_code": self.edge_code,
+            "upstream_node": self.upstream_node,
+            "downstream_node": self.downstream_node,
+            "target_wide_table": self.target_table(),
+            "source_job_code": self.source_job_code,
+            "support_key": self.support_key,
+            "revision": self.revision,
+            "confirmation": self.confirmation,
+            "historical": self.historical,
+            "invalid_reason": self.invalid_reason,
+            "last_traced": self.last_traced,
+        }
+
+
+@dataclass
+class RecomputeJob:
+    """重算作业：记录来源核验、领用、复核与物化写入的完整依据。
+
+    ``accepted_before_fix`` 标记该重算是否在目标校验修复前已被受理。
+    这类作业即使被领用也只允许进入物化复核，不能作为采购数据写出。
+    ``cached_trial_amount`` 是旧试算缓存值（例如 11），只用于复核展示，
+    永远不能进入补货明细或快照导出。
+    """
+    recompute_id: int
+    job_code: str
+    target_wide_table: str
+    source_codes: list[str]
+    lineage_edge_ids: list[int]
+    cached_trial_amount: float = 0.0
+    status: str = "待领"
+    accepted_before_fix: bool = False
+    revision: int = 0
+    claim_token: str = ""
+    claimed_by: str = ""
+    claimed_at: str = ""
+    claim_sequence: int = 0
+    review_reason: str = ""
+    eligible_for_purchase: bool = False
+    evidence: list[dict[str, Any]] = field(default_factory=list)
+    verification: dict[str, Any] = field(default_factory=dict)
+    materialized_rows: list[dict[str, Any]] = field(default_factory=list)
+    write_requests: list[dict[str, Any]] = field(default_factory=list)
+    audit_log: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_summary(self) -> dict[str, Any]:
+        return {
+            "recompute_id": self.recompute_id,
+            "job_code": self.job_code,
+            "target_wide_table": self.target_wide_table,
+            "source_codes": list(self.source_codes),
+            "lineage_edge_ids": list(self.lineage_edge_ids),
+            "cached_trial_amount": self.cached_trial_amount,
+            "status": self.status,
+            "accepted_before_fix": self.accepted_before_fix,
+            "revision": self.revision,
+            "claim_token": self.claim_token,
+            "claimed_by": self.claimed_by,
+            "review_reason": self.review_reason,
+            "eligible_for_purchase": self.eligible_for_purchase,
+            "evidence": list(self.evidence),
+            "verification": dict(self.verification),
+            "materialized_rows": list(self.materialized_rows),
+            "write_requests": list(self.write_requests),
+        }
 
 
 @dataclass

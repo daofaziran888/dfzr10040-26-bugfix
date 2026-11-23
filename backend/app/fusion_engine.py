@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 
 from app.models import (
     BackfillTask,
@@ -23,6 +23,7 @@ from app.models import (
     MetricAggrRule,
     PartitionRule,
     QualityGateRule,
+    RecomputeJob,
     SchemaMapping,
     SnapshotPartition,
     SourceDef,
@@ -60,6 +61,8 @@ class FusionEngine:
         self._cross_validates: dict[int, CrossValidatePlan] = {}
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
+        self._recomputes: dict[int, RecomputeJob] = {}
+        self._aggregate_rows: dict[int, list[dict[str, Any]]] = {}
         self._next_id: int = 1
 
     def _next_seq(self) -> int:
@@ -549,6 +552,10 @@ class FusionEngine:
         if snap is None:
             return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在"}
 
+        # 重算产生的快照只读聚合行，且必须携带确认依据才能交付。
+        if snap.recompute_id:
+            return self.execute_procurement_export_from_snapshot(export_id, snapshot_id)
+
         fusion_job = self._find_fusion_job_by_table(snap.target_wide_table)
         records = fusion_job.merged_records if fusion_job else []
 
@@ -688,7 +695,12 @@ class FusionEngine:
         }
 
     def build_wide_table_from_fusion(self, wide_table_id: int, fusion_job_id: int) -> dict[str, Any]:
-        """从融合作业结果构建宽表定义，产生数据血缘边。"""
+        """从融合作业结果构建宽表定义，产生可核查的数据血缘边。
+
+        目标校验是整条链路的前置条件：作业的 ``target_wide_table`` 必须与
+        宽表定义一致（表编号或表名称任一匹配）。不匹配时直接拒绝，
+        不写任何边、不改来源计数。
+        """
         wt = self._wide_tables.get(wide_table_id)
         job = self._fusion_jobs.get(fusion_job_id)
 
@@ -697,11 +709,48 @@ class FusionEngine:
         if job is None:
             return {"ok": False, "message": f"融合作业 {fusion_job_id} 不存在"}
 
-        wt.source_count = len(job.participant_sources)
+        target_check = self._check_job_target(wt, job)
+        if not target_check["matched"]:
+            return {
+                "ok": False,
+                "message": (
+                    f"作业 {job.job_code} 的目标宽表「{job.target_wide_table}」"
+                    f"与宽表定义「{wt.table_name}」（{wt.table_code}）不一致，拒绝构建"
+                ),
+                "target_check": target_check,
+                "source_count": self._active_source_count(wt),
+                "lineage_edges": [],
+            }
+
+        unknown_sources = [
+            code for code in job.participant_sources
+            if self._find_source_by_code(code) is None
+        ]
+        if unknown_sources:
+            return {
+                "ok": False,
+                "message": f"作业 {job.job_code} 含未登记来源：{'、'.join(unknown_sources)}",
+                "target_check": target_check,
+                "source_count": self._active_source_count(wt),
+                "lineage_edges": [],
+            }
+
+        wt.revision += 1
+        wt.lineage_revision = wt.revision
         wt.last_updated = _now_iso()
 
-        lineages: list[str] = []
-        for source_code in job.participant_sources:
+        # 同一来源在同一修订里只能形成一条有效支持：按来源去重并保序。
+        unique_sources = list(dict.fromkeys(job.participant_sources))
+        edges: list[LineageEdge] = []
+        for source_code in unique_sources:
+            support_key = self._source_support_key(wt, job, source_code)
+            existing = self._find_active_edge(support_key)
+            if existing is not None:
+                existing.related_fields = list(wt.field_list)
+                existing.last_traced = _now_iso()
+                existing.revision = wt.revision
+                edges.append(existing)
+                continue
             edge = self.create_lineage_edge(
                 upstream_node=source_code,
                 downstream_node=wt.table_name,
@@ -709,14 +758,168 @@ class FusionEngine:
                 edge_type="fusion_map",
                 dependency_level=1,
             )
-            lineages.append(edge.edge_code)
+            edge.target_wide_table = wt.table_name
+            edge.source_job_code = job.job_code
+            edge.support_key = support_key
+            edge.revision = wt.revision
+            edge.confirmation = "已追踪"
+            self._lineages[edge.edge_id] = edge
+            edges.append(edge)
 
+        wt.source_count = len(edges)
+        detail = [self._edge_detail(edge) for edge in edges]
         return {
             "ok": True,
             "table_code": wt.table_code,
+            "table_name": wt.table_name,
+            "target_check": target_check,
             "source_count": wt.source_count,
-            "lineage_edges": lineages,
+            "lineage_edges": [edge.edge_code for edge in edges],
+            "source_lineage_detail": detail,
+            "revision": wt.revision,
             "last_updated": wt.last_updated,
+        }
+
+    def confirm_source_lineage(self, wide_table_id: int, source_codes: list[str],
+                               operator: str = "值班") -> dict[str, Any]:
+        """确认指定来源的血缘；未确认前不得据此发起重算领取。
+
+        只能确认当前修订中的有效边。历史错配边只能查历史，无法被确认。
+        """
+        wt = self._wide_tables.get(wide_table_id)
+        if wt is None:
+            return {"ok": False, "message": f"宽表定义 {wide_table_id} 不存在"}
+
+        active = self._active_edges_for(wt)
+        by_source = {edge.upstream_node: edge for edge in active}
+        missing = [code for code in source_codes if code not in by_source]
+        if missing:
+            return {
+                "ok": False,
+                "message": f"来源 {'、'.join(missing)} 没有当前有效血缘，无法确认",
+                "source_count": len(active),
+            }
+
+        confirmed_at = _now_iso()
+        for code in dict.fromkeys(source_codes):
+            edge = by_source[code]
+            edge.confirmation = "已确认"
+            edge.confirmed_by = operator
+            edge.confirmed_at = confirmed_at
+            edge.last_traced = confirmed_at
+
+        detail = [self.source_lineage_detail(wt.table_id)]
+        return {
+            "ok": True,
+            "table_code": wt.table_code,
+            "source_count": self._active_source_count(wt),
+            "confirmed_sources": list(dict.fromkeys(source_codes)),
+            "source_lineage_detail": detail[0]["sources"],
+        }
+
+    def source_lineage_detail(self, wide_table_id: int,
+                              include_historical: bool = False) -> dict[str, Any]:
+        """生成可核查的来源血缘明细：每条有效边对应一个来源的一次有效支持。"""
+        wt = self._wide_tables.get(wide_table_id)
+        if wt is None:
+            return {"ok": False, "message": f"宽表定义 {wide_table_id} 不存在", "sources": []}
+
+        active: dict[str, LineageEdge] = {}
+        for edge in self._active_edges_for(wt):
+            # 同一来源只保留最早的一条有效支持，重复配置不会放大来源数。
+            active.setdefault(edge.upstream_node, edge)
+        historical = self._historical_edges_for(wt)
+        sources = [
+            {
+                "source": edge.upstream_node,
+                "support_key": edge.support_key or self._source_support_key(wt, None, edge.upstream_node),
+                "edge_code": edge.edge_code,
+                "revision": edge.revision,
+                "confirmation": edge.confirmation,
+                "source_job_code": edge.source_job_code,
+                "evidence": edge.to_evidence(),
+            }
+            for edge in active.values()
+        ]
+        payload: dict[str, Any] = {
+            "ok": True,
+            "table_code": wt.table_code,
+            "table_name": wt.table_name,
+            "revision": wt.lineage_revision,
+            "source_count": len(sources),
+            "sources": sources,
+        }
+        if include_historical:
+            payload["historical"] = [edge.to_evidence() for edge in historical]
+        return payload
+
+    def historical_lineage(self, wide_table_id: int) -> dict[str, Any]:
+        """历史版本的原证据仍须可查：错配边只从这里读取。"""
+        wt = self._wide_tables.get(wide_table_id)
+        if wt is None:
+            return {"ok": False, "message": f"宽表定义 {wide_table_id} 不存在", "historical": []}
+        historical = [edge.to_evidence() for edge in self._historical_edges_for(wt)]
+        return {
+            "ok": True,
+            "table_code": wt.table_code,
+            "historical_count": len(historical),
+            "historical": historical,
+        }
+
+    def _check_job_target(self, wt: WideTableDef, job: FusionJob) -> dict[str, Any]:
+        job_target = str(job.target_wide_table or "").strip()
+        matched = job_target in {wt.table_code, wt.table_name}
+        return {
+            "matched": matched,
+            "job_target": job_target,
+            "expected_table_code": wt.table_code,
+            "expected_table_name": wt.table_name,
+        }
+
+    @staticmethod
+    def _source_support_key(wt: WideTableDef, job: FusionJob | None, source_code: str) -> str:
+        job_code = job.job_code if job is not None else ""
+        return f"{wt.table_code}::{source_code}"
+
+    def _find_active_edge(self, support_key: str) -> LineageEdge | None:
+        for edge in self._lineages.values():
+            if edge.support_key == support_key and edge.is_active():
+                return edge
+        return None
+
+    @staticmethod
+    def _edge_belongs_to(edge: LineageEdge, wt: WideTableDef) -> bool:
+        """边归属按宽表表名称或表编号匹配，避免历史数据里的写法差异漏判。"""
+        return edge.target_table() in {wt.table_name, wt.table_code}
+
+    def _active_edges_for(self, wt: WideTableDef) -> list[LineageEdge]:
+        """当前修订的有效边：必须带构建凭据（support_key），手工边不冒充来源。"""
+        edges = [
+            edge for edge in self._lineages.values()
+            if edge.support_key
+            and edge.is_active()
+            and self._edge_belongs_to(edge, wt)
+        ]
+        return sorted(edges, key=lambda edge: edge.edge_id)
+
+    def _active_source_count(self, wt: WideTableDef) -> int:
+        return len({edge.upstream_node for edge in self._active_edges_for(wt)})
+
+    def _historical_edges_for(self, wt: WideTableDef) -> list[LineageEdge]:
+        edges = [
+            edge for edge in self._lineages.values()
+            if edge.historical and self._edge_belongs_to(edge, wt)
+        ]
+        return sorted(edges, key=lambda edge: edge.edge_id)
+
+    @staticmethod
+    def _edge_detail(edge: LineageEdge) -> dict[str, Any]:
+        return {
+            "source": edge.upstream_node,
+            "edge_code": edge.edge_code,
+            "confirmation": edge.confirmation,
+            "revision": edge.revision,
+            "evidence": edge.to_evidence(),
         }
 
     def compute_metric_from_lineage(self, lineage_edge_id: int,
@@ -727,6 +930,12 @@ class FusionEngine:
         edge = self._lineages.get(lineage_edge_id)
         if edge is None:
             return {"ok": False, "message": f"数据血缘边 {lineage_edge_id} 不存在"}
+        if edge.historical:
+            return {
+                "ok": False,
+                "message": f"血缘边 {edge.edge_code} 是历史错配边，只能查询历史，不能用于确认新指标",
+                "edge": edge.to_evidence(),
+            }
 
         rule = self.create_metric_aggr_rule(
             target_wide_table=target_wide_table,
@@ -741,9 +950,625 @@ class FusionEngine:
             "from_lineage": edge.edge_code,
             "agg_function": agg_function,
             "group_dimensions": group_dimensions,
+            "lineage_evidence": edge.to_evidence(),
         }
 
+    # ---- 来源修订、重算领取、物化复核与采购交付 ----
+
+    def start_source_revision(self, wide_table_id: int, source_codes: list[str],
+                              operator: str = "值班") -> dict[str, Any]:
+        """开启 B 的来源修订交接：把移出配置的旧边留作历史证据，新边待确认。
+
+        修订期间任何重算领取都会先做来源核验，未确认的合法来源不会被当作支持。
+        """
+        wt = self._wide_tables.get(wide_table_id)
+        if wt is None:
+            return {"ok": False, "message": f"宽表定义 {wide_table_id} 不存在"}
+        wanted = list(dict.fromkeys(source_codes))
+        wt.revision += 1
+        wt.lineage_revision = wt.revision
+        wt.last_updated = _now_iso()
+
+        historical: list[str] = []
+        pending: list[str] = []
+        for edge in self._active_edges_for(wt):
+            if edge.upstream_node not in wanted:
+                edge.historical = True
+                edge.confirmation = "历史"
+                edge.invalid_reason = "来源修订移出当前配置"
+                historical.append(edge.edge_code)
+            else:
+                edge.confirmation = "待确认"
+                edge.confirmed_by = ""
+                edge.confirmed_at = ""
+                edge.revision = wt.revision
+                pending.append(edge.edge_code)
+
+        return {
+            "ok": True,
+            "table_code": wt.table_code,
+            "revision": wt.revision,
+            "operator": operator,
+            "pending_confirmation": pending,
+            "moved_to_history": historical,
+            "source_count": self._active_source_count(wt),
+        }
+
+    def invalidate_lineage_edge(self, edge_code: str, reason: str) -> dict[str, Any]:
+        """把错配边标记为历史：保留首次记录的原证据，不再产生任何有效支持。"""
+        for edge in self._lineages.values():
+            if edge.edge_code == edge_code:
+                if edge.historical:
+                    return {
+                        "ok": True,
+                        "already_historical": True,
+                        "edge": edge.to_evidence(),
+                    }
+                edge.historical = True
+                edge.confirmation = "历史"
+                edge.invalid_reason = reason or "目标错配"
+                return {"ok": True, "already_historical": False, "edge": edge.to_evidence()}
+        return {"ok": False, "message": f"血缘边 {edge_code} 不存在"}
+
+    def record_historical_lineage(self, upstream_node: str, downstream_node: str,
+                                  target_wide_table: str = "",
+                                  source_job_code: str = "",
+                                  related_fields: list[str] | None = None,
+                                  invalid_reason: str = "历史版本错配边") -> dict[str, Any]:
+        """导入修复前已存在的错配边：直接以历史证据入库，只可查询、不可使用。"""
+        edge = self.create_lineage_edge(
+            upstream_node=upstream_node,
+            downstream_node=downstream_node,
+            related_fields=related_fields or [],
+            edge_type="fusion_map",
+            dependency_level=1,
+        )
+        edge.target_wide_table = target_wide_table or downstream_node
+        edge.source_job_code = source_job_code
+        edge.support_key = f"{edge.target_wide_table}::{upstream_node}"
+        edge.confirmation = "历史"
+        edge.historical = True
+        edge.invalid_reason = invalid_reason
+        self._lineages[edge.edge_id] = edge
+        return {"ok": True, "edge": edge.to_evidence()}
+
+    def submit_recompute(self, target_wide_table: str, source_codes: list[str],
+                         lineage_edge_ids: list[int] | None = None,
+                         cached_trial_amount: float = 0.0,
+                         accepted_before_fix: bool = False,
+                         revision: int = 0) -> RecomputeJob:
+        """登记一次重算。修复前受理的作业必须带 ``accepted_before_fix``。"""
+        rid = self._next_seq()
+        job = RecomputeJob(
+            recompute_id=rid,
+            job_code=_generate_code("RECO", rid),
+            target_wide_table=target_wide_table,
+            source_codes=list(dict.fromkeys(source_codes)),
+            lineage_edge_ids=list(lineage_edge_ids or []),
+            cached_trial_amount=cached_trial_amount,
+            status="待领",
+            accepted_before_fix=accepted_before_fix,
+            revision=revision,
+        )
+        self._recomputes[rid] = job
+        return job
+
+    def release_recompute(self, recompute_id: int, reason: str = "执行超时") -> dict[str, Any]:
+        """旧重算超时后重新回到夜班待领集合，试算缓存原样保留。
+
+        回到待领不代表具备写入资格：领取时仍会重新做来源核验。
+        """
+        job = self._recomputes.get(recompute_id)
+        if job is None:
+            return {"ok": False, "message": f"重算作业 {recompute_id} 不存在"}
+        job.status = "待领"
+        job.claim_token = ""
+        job.claimed_by = ""
+        job.claimed_at = ""
+        job.eligible_for_purchase = False
+        job.audit_log.append({
+            "action": "returned_to_pending",
+            "reason": reason,
+            "at": _now_iso(),
+            "cached_trial_amount": job.cached_trial_amount,
+        })
+        return {
+            "ok": True,
+            "status": job.status,
+            "cached_trial_amount": job.cached_trial_amount,
+            "message": f"重算作业 {job.job_code} 已回到待领集合：{reason}",
+            "job": job.to_summary(),
+        }
+
+    def get_recompute(self, recompute_id: int) -> RecomputeJob | None:
+        return self._recomputes.get(recompute_id)
+
+    def claim_recompute(self, recompute_id: int, worker: str = "夜班",
+                        claim_token: str = "") -> dict[str, Any]:
+        """领取重算：先核验来源血缘，再决定送复核还是保留待核。
+
+        领取本身可能因来源核验与旧作业恢复发生冲突：
+        - 修复前受理的旧作业，即便被领走也只进复核，不具备写入资格；
+        - 合法来源尚未确认时，领取不生效，作业保留在待领集合并记录依据；
+        - 历史错配边不会成为任何领取的依据。
+        """
+        job = self._recomputes.get(recompute_id)
+        if job is None:
+            return {"ok": False, "message": f"重算作业 {recompute_id} 不存在", "claimed": False}
+
+        token = claim_token or f"CLAIM-{job.job_code}-{job.claim_sequence + 1}"
+        if job.status not in {"待领", "待重放"}:
+            same_claim = bool(job.claim_token) and job.claim_token == token
+            return {
+                "ok": same_claim,
+                "claimed": False,
+                "duplicate": same_claim,
+                "status": job.status,
+                "message": (
+                    f"重算作业 {job.job_code} 已被领取（{job.claimed_by}）"
+                    if not same_claim else
+                    f"重算作业 {job.job_code} 的领取已受理，未重复生效"
+                ),
+                "job": job.to_summary(),
+            }
+
+        verification = self._verify_recompute_sources(job)
+        job.evidence = verification["evidence"]
+        job.verification = verification
+        conflict = self._claim_conflict(job, verification)
+
+        if conflict:
+            job.audit_log.append({
+                "action": "claim_conflict",
+                "worker": worker,
+                "at": _now_iso(),
+                "conflict": conflict,
+                "verification": verification["status"],
+            })
+            if job.accepted_before_fix:
+                # 旧作业恢复优先于来源切换：只送复核，不能写入，也不能作为采购依据。
+                job.claim_sequence += 1
+                job.claim_token = token
+                job.claimed_by = worker
+                job.claimed_at = _now_iso()
+                job.status = "复核中"
+                job.review_reason = conflict
+                job.eligible_for_purchase = False
+                return {
+                    "ok": True,
+                    "claimed": True,
+                    "status": job.status,
+                    "route": "复核",
+                    "eligible_for_purchase": False,
+                    "message": f"旧作业 {job.job_code} 已进入物化复核，不参与写入与采购",
+                    "evidence": job.evidence,
+                    "verification": job.verification,
+                    "job": job.to_summary(),
+                }
+            # 合法来源未确认：领取不生效，保留待领等待来源核验完成。
+            job.audit_log.append({
+                "action": "claim_deferred",
+                "worker": worker,
+                "at": _now_iso(),
+                "reason": conflict,
+            })
+            return {
+                "ok": False,
+                "claimed": False,
+                "status": job.status,
+                "route": "待领",
+                "eligible_for_purchase": False,
+                "message": f"来源核验未通过，重算作业 {job.job_code} 保留待领",
+                "evidence": job.evidence,
+                "verification": job.verification,
+                "job": job.to_summary(),
+            }
+
+        job.claim_sequence += 1
+        job.claim_token = token
+        job.claimed_by = worker
+        job.claimed_at = _now_iso()
+        job.status = "已领取"
+        job.eligible_for_purchase = True
+        return {
+            "ok": True,
+            "claimed": True,
+            "status": job.status,
+            "route": "物化",
+            "eligible_for_purchase": True,
+            "message": f"重算作业 {job.job_code} 来源核验通过，进入物化",
+            "evidence": job.evidence,
+            "verification": job.verification,
+            "job": job.to_summary(),
+        }
+
+    def materialize_recompute(self, recompute_id: int, claim_token: str) -> dict[str, Any]:
+        """物化阶段：只有复核通过且具备确认依据的领取才能写出聚合行。
+
+        修复前受理的旧重算始终停在复核，即便重复送达写入请求也不会写出结果。
+        """
+        job = self._recomputes.get(recompute_id)
+        if job is None:
+            return {"ok": False, "message": f"重算作业 {recompute_id} 不存在", "written": 0}
+
+        if job.status == "复核中":
+            return {
+                "ok": True,
+                "written": 0,
+                "review_only": True,
+                "message": f"旧作业 {job.job_code} 只允许物化复核，未写出任何聚合行",
+                "cached_trial_amount": job.cached_trial_amount,
+                "evidence": job.evidence,
+                "verification": job.verification,
+                "job": job.to_summary(),
+            }
+        if job.status not in {"已领取", "已物化"}:
+            return {
+                "ok": False,
+                "written": 0,
+                "message": f"重算作业 {job.job_code} 当前状态 {job.status} 不允许物化",
+                "job": job.to_summary(),
+            }
+        if not claim_token or claim_token != job.claim_token:
+            return {
+                "ok": False,
+                "written": 0,
+                "message": f"重算作业 {job.job_code} 的领取凭据不匹配",
+                "job": job.to_summary(),
+            }
+
+        rows_after = self.materialize_metric_rows(job)
+        job.status = "已物化"
+        job.materialized_rows = rows_after
+        return {
+            "ok": True,
+            "written": len(rows_after),
+            "review_only": False,
+            "message": f"重算作业 {job.job_code} 已按确认来源写出 {len(rows_after)} 行聚合",
+            "aggregate_rows": rows_after,
+            "evidence": job.evidence,
+            "verification": job.verification,
+            "job": job.to_summary(),
+        }
+
+    def submit_write_request(self, recompute_id: int, request_id: str,
+                             claim_token: str = "") -> dict[str, Any]:
+        """重送写入请求：按 request_id 幂等，重复请求不会二次写出。"""
+        job = self._recomputes.get(recompute_id)
+        if job is None:
+            return {"ok": False, "message": f"重算作业 {recompute_id} 不存在", "written": 0}
+        if not request_id:
+            return {"ok": False, "message": "写入请求缺少 request_id", "written": 0}
+
+        prior = next(
+            (item for item in job.write_requests if item.get("request_id") == request_id),
+            None,
+        )
+        if prior is not None:
+            accepted = prior.get("action") == "written"
+            return {
+                "ok": accepted,
+                "duplicate": True,
+                "written": 0,
+                "message": (
+                    f"写入请求 {request_id} 已写出过，本次未重复写出"
+                    if accepted else
+                    f"写入请求 {request_id} 已被拒绝，重复送达仍不写出"
+                ),
+                "evidence": job.evidence,
+                "verification": job.verification,
+                "job": job.to_summary(),
+            }
+
+        if job.accepted_before_fix or job.status == "复核中":
+            job.write_requests.append({
+                "request_id": request_id,
+                "action": "rejected",
+                "reason": "修复前受理，仅供物化复核",
+                "at": _now_iso(),
+            })
+            return {
+                "ok": False,
+                "duplicate": False,
+                "written": 0,
+                "message": f"旧作业 {job.job_code} 的写入请求被拒绝：只允许复核，不能写出结果",
+                "evidence": job.evidence,
+                "verification": job.verification,
+                "job": job.to_summary(),
+            }
+
+        materialize = self.materialize_recompute(recompute_id, claim_token)
+        row = {
+            "request_id": request_id,
+            "action": "written" if materialize.get("written") else "no_write",
+            "written": materialize.get("written", 0),
+            "at": _now_iso(),
+        }
+        job.write_requests.append(row)
+        return {
+            "ok": bool(materialize.get("ok")),
+            "duplicate": False,
+            "written": materialize.get("written", 0),
+            "message": materialize.get("message", ""),
+            "aggregate_rows": materialize.get("aggregate_rows", []),
+            "evidence": job.evidence,
+            "verification": job.verification,
+            "job": job.to_summary(),
+        }
+
+    def procurement_replenishment_detail(self, recompute_id: int) -> dict[str, Any]:
+        """读取补货明细：只返回有确认依据且已物化的聚合行，试算金额永不交付。"""
+        job = self._recomputes.get(recompute_id)
+        if job is None:
+            return {"ok": False, "message": f"重算作业 {recompute_id} 不存在", "rows": []}
+        if job.cached_trial_amount:
+            trial_excluded = job.cached_trial_amount
+        else:
+            trial_excluded = None
+
+        blocked = self._procurement_block_reason(job)
+        if blocked or not job.materialized_rows:
+            return {
+                "ok": True,
+                "eligible": False,
+                "rows": [],
+                "trial_amount_excluded": trial_excluded,
+                "message": blocked or "没有可交付的聚合行",
+                "evidence": job.evidence,
+                "verification": job.verification,
+            }
+        rows = [
+            row for row in job.materialized_rows
+            if row.get("eligible_for_purchase") is True
+        ]
+        return {
+            "ok": True,
+            "eligible": bool(rows),
+            "rows": rows,
+            "trial_amount_excluded": trial_excluded,
+            "message": f"交付 {len(rows)} 行有确认依据的聚合明细",
+            "evidence": job.evidence,
+            "verification": job.verification,
+        }
+
+    def execute_procurement_export_from_snapshot(self, export_id: int,
+                                                 snapshot_id: int) -> dict[str, Any]:
+        """采购快照导出：只读聚合行，只交付来源已确认且已物化的结果。"""
+        plan = self._exports.get(export_id)
+        snap = self._snapshots.get(snapshot_id)
+        if plan is None:
+            return {"ok": False, "message": f"导出计划 {export_id} 不存在", "rows": []}
+        if snap is None:
+            return {"ok": False, "message": f"分区快照 {snapshot_id} 不存在", "rows": []}
+        if plan.target_wide_table != snap.target_wide_table:
+            return {"ok": False, "message": "导出计划与快照目标宽表不一致", "rows": []}
+
+        blocked = snap.procurement_block_reason
+        if not snap.procurement_eligible or blocked:
+            return {
+                "ok": False,
+                "eligible": False,
+                "rows": [],
+                "message": blocked or "快照没有确认依据，不能交付采购",
+                "snapshot": self._snapshot_evidence(snap),
+            }
+
+        rows = [
+            row for row in snap.aggregate_rows
+            if row.get("eligible_for_purchase") is True
+        ]
+        if not rows:
+            return {
+                "ok": False,
+                "eligible": False,
+                "rows": [],
+                "message": "快照内没有具备确认依据的聚合行",
+                "snapshot": self._snapshot_evidence(snap),
+            }
+        plan.export_status = "已完成"
+        return {
+            "ok": True,
+            "eligible": True,
+            "plan_code": plan.plan_code,
+            "snapshot_code": snap.partition_code,
+            "exported_rows": len(rows),
+            "rows": rows,
+            "lineage_evidence": snap.lineage_evidence,
+            "snapshot": self._snapshot_evidence(snap),
+        }
+
+    def materialize_metric_rows(self, job: RecomputeJob) -> list[dict[str, Any]]:
+        """按来源血缘明细约束真正写入的聚合行。
+
+        只用当前修订中已确认、非历史、且来自本作业来源的边；
+        同一来源只计一次支持，试算金额不进入聚合。
+        """
+        wt = self._find_wide_table(job.target_wide_table)
+        if wt is None:
+            return []
+        confirmed = [
+            edge for edge in self._active_edges_for(wt)
+            if edge.is_confirmed() and edge.upstream_node in set(job.source_codes)
+        ]
+        if job.lineage_edge_ids:
+            declared = set(job.lineage_edge_ids)
+            confirmed = [edge for edge in confirmed if edge.edge_id in declared]
+        # 明细按来源去重：一条来源只对应一个有效支持。
+        unique: dict[str, LineageEdge] = {}
+        for edge in confirmed:
+            unique.setdefault(edge.upstream_node, edge)
+        if not unique:
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for source_code, edge in unique.items():
+            rows.append({
+                "source": source_code,
+                "edge_code": edge.edge_code,
+                "revision": edge.revision,
+                "confirmation": edge.confirmation,
+                "target_wide_table": wt.table_name,
+                "value": self._source_sample_value(source_code),
+                "eligible_for_purchase": True,
+                "evidence": edge.to_evidence(),
+            })
+        return rows
+
     # ---- 辅助方法 ----
+
+    def _find_wide_table(self, table_ref: str) -> WideTableDef | None:
+        for wt in self._wide_tables.values():
+            if table_ref in {wt.table_code, wt.table_name}:
+                return wt
+        return None
+
+    def _verify_recompute_sources(self, job: RecomputeJob) -> dict[str, Any]:
+        """核验重算来源：目标必须存在，来源必须落在当前修订的有效边内。"""
+        wt = self._find_wide_table(job.target_wide_table)
+        if wt is None:
+            return {
+                "status": "目标宽表不存在",
+                "evidence": [],
+                "confirmed_sources": [],
+                "unconfirmed_sources": list(job.source_codes),
+            }
+        active = self._active_edges_for(wt)
+        by_source = {edge.upstream_node: edge for edge in active}
+        confirmed_sources = [
+            code for code in job.source_codes
+            if code in by_source and by_source[code].is_confirmed()
+        ]
+        unconfirmed_sources = [
+            code for code in job.source_codes
+            if code in by_source and not by_source[code].is_confirmed()
+        ]
+        missing_sources = [code for code in job.source_codes if code not in by_source]
+        evidence: list[dict[str, Any]] = []
+        for code in job.source_codes:
+            edge = by_source.get(code)
+            evidence.append({
+                "source": code,
+                "edge_code": edge.edge_code if edge else "",
+                "confirmation": edge.confirmation if edge else "无有效血缘",
+                "revision": edge.revision if edge else wt.lineage_revision,
+                "historical": edge.historical if edge else False,
+                "verdict": (
+                    "已确认" if edge and edge.is_confirmed()
+                    else "待确认" if edge
+                    else "无有效血缘"
+                ),
+            })
+        historical_refs = [
+            edge.to_evidence() for edge in self._historical_edges_for(wt)
+        ]
+        declared_edges: list[dict[str, Any]] = []
+        invalid_declared: list[str] = []
+        for edge_id in job.lineage_edge_ids:
+            edge = self._lineages.get(edge_id)
+            if edge is None:
+                invalid_declared.append(f"血缘边 {edge_id} 不存在")
+                continue
+            usable = (
+                edge.is_active()
+                and self._edge_belongs_to(edge, wt)
+                and edge.upstream_node in set(job.source_codes)
+            )
+            declared_edges.append({
+                "edge_id": edge_id,
+                "edge_code": edge.edge_code,
+                "verdict": "可用" if usable else "不可用",
+                "historical": edge.historical,
+                "invalid_reason": edge.invalid_reason,
+            })
+            if not usable:
+                invalid_declared.append(
+                    f"血缘边 {edge.edge_code} 不能用于本次重算"
+                )
+        status = "已确认" if len(confirmed_sources) == len(job.source_codes) else "待确认"
+        if missing_sources or invalid_declared:
+            status = "来源缺失"
+        return {
+            "status": status,
+            "revision": wt.lineage_revision,
+            "confirmed_sources": confirmed_sources,
+            "unconfirmed_sources": unconfirmed_sources,
+            "missing_sources": missing_sources,
+            "declared_edges": declared_edges,
+            "invalid_declared_edges": invalid_declared,
+            "evidence": evidence,
+            "historical_evidence": historical_refs,
+        }
+
+    def _claim_conflict(self, job: RecomputeJob, verification: dict[str, Any]) -> str:
+        if job.accepted_before_fix:
+            return "修复前受理的重算：只允许进入物化复核"
+        if verification["missing_sources"]:
+            return f"来源 {'、'.join(verification['missing_sources'])} 没有当前有效血缘"
+        if verification.get("invalid_declared_edges"):
+            return "；".join(verification["invalid_declared_edges"])
+        if verification["unconfirmed_sources"]:
+            return f"来源 {'、'.join(verification['unconfirmed_sources'])} 尚未确认"
+        return ""
+
+    def _procurement_block_reason(self, job: RecomputeJob) -> str:
+        if job.cached_trial_amount:
+            return "仅含旧试算缓存，不能作为采购依据"
+        if job.accepted_before_fix:
+            return "修复前受理的重算不能作为有资格的数据"
+        if job.status != "已物化":
+            return "重算尚未物化"
+        if not job.eligible_for_purchase:
+            return "重算没有采购交付资格"
+        return ""
+
+    @staticmethod
+    def _source_sample_value(source_code: str) -> float:
+        """来源级样本值，用于验证聚合行的真实来源（不读取任何试算缓存）。"""
+        return float(sum(ord(ch) for ch in source_code) % 97 + 1)
+
+    @staticmethod
+    def _snapshot_evidence(snap: SnapshotPartition) -> dict[str, Any]:
+        return {
+            "partition_code": snap.partition_code,
+            "target_wide_table": snap.target_wide_table,
+            "recompute_id": snap.recompute_id,
+            "lineage_revision": snap.lineage_revision,
+            "source_codes": list(snap.source_codes),
+            "procurement_eligible": snap.procurement_eligible,
+            "procurement_block_reason": snap.procurement_block_reason,
+        }
+
+    def create_recompute_snapshot(self, recompute_id: int,
+                                  partition_key_value: str) -> dict[str, Any]:
+        """为重算结果创建分区快照，并把聚合行与真实血缘依据一并固化。"""
+        job = self._recomputes.get(recompute_id)
+        if job is None:
+            return {"ok": False, "message": f"重算作业 {recompute_id} 不存在"}
+        wt = self._find_wide_table(job.target_wide_table)
+        if wt is None:
+            return {"ok": False, "message": f"目标宽表 {job.target_wide_table} 不存在"}
+
+        snap = self.create_snapshot(wt.table_name, partition_key_value=partition_key_value)
+        snap.recompute_id = job.recompute_id
+        snap.lineage_revision = wt.lineage_revision
+        snap.source_codes = list(job.source_codes)
+        snap.aggregate_rows = list(job.materialized_rows)
+        snap.lineage_evidence = [
+            edge.to_evidence() for edge in self._active_edges_for(wt)
+            if edge.is_confirmed() and edge.upstream_node in set(job.source_codes)
+        ]
+        block = self._procurement_block_reason(job)
+        snap.procurement_eligible = not block and bool(snap.aggregate_rows)
+        snap.procurement_block_reason = block
+        snap.record_count = len(snap.aggregate_rows)
+        return {
+            "ok": True,
+            "snapshot": self._snapshot_evidence(snap),
+            "partition_id": snap.partition_id,
+            "partition_code": snap.partition_code,
+            "aggregate_rows": snap.aggregate_rows,
+            "lineage_evidence": snap.lineage_evidence,
+        }
 
     def _find_source_by_code(self, source_code: str) -> SourceDef | None:
         for source in self._sources.values():
@@ -874,6 +1699,9 @@ class FusionEngine:
             "cross_validates": len(self._cross_validates),
             "drifts": len(self._drifts),
             "monitors": len(self._monitors),
+            "recomputes": len(self._recomputes),
+            "historical_lineages": sum(
+                1 for edge in self._lineages.values() if edge.historical),
         }
 
 
